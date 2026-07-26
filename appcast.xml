@@ -5,6 +5,16 @@
         <link>https://raw.githubusercontent.com/andyhtran/CopyCat/main/appcast.xml</link>
         <description>CopyCat updates</description>
         <item>
+            <title>1.2.0</title>
+            <pubDate>Sat, 25 Jul 2026 23:00:18 -0400</pubDate>
+            <link>https://raw.githubusercontent.com/andyhtran/CopyCat/main/appcast.xml</link>
+            <sparkle:version>2607252258</sparkle:version>
+            <sparkle:shortVersionString>1.2.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/andyhtran/CopyCat/releases/download/v1.2.0/CopyCat-1.2.0.zip" length="1601064" type="application/octet-stream" sparkle:edSignature="nYXld/I3vVzAoFaFGlVP9Nwp3DigL41PPhSd1HvDOTI44JM8xq9FwSJh/QFPH5EbnoqUPBhoZ7CaWf5ms+BzCw=="/>
+        </item>
+        <item>
             <title>1.1.1</title>
             <pubDate>Wed, 22 Jul 2026 20:49:41 -0400</pubDate>
             <link>https://raw.githubusercontent.com/andyhtran/CopyCat/main/appcast.xml</link>
@@ -23,16 +33,6 @@
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <enclosure url="https://github.com/andyhtran/CopyCat/releases/download/v1.1.0/CopyCat-1.1.0.zip" length="1569243" type="application/octet-stream" sparkle:edSignature="OODadQyQRvblbdp1uQ5JOYTtyqzqvORMFh9xRnZ1WM8G+7ISCDUm42Qj91fA8RYAFS0saIiGW70QjuQGX71HDA=="/>
-        </item>
-        <item>
-            <title>1.0.0</title>
-            <pubDate>Wed, 15 Jul 2026 00:15:36 -0400</pubDate>
-            <link>https://raw.githubusercontent.com/andyhtran/CopyCat/main/appcast.xml</link>
-            <sparkle:version>2607150014</sparkle:version>
-            <sparkle:shortVersionString>1.0.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/andyhtran/CopyCat/releases/download/v1.0.0/CopyCat-1.0.0.zip" length="1509536" type="application/octet-stream" sparkle:edSignature="guWqdVEH0BA/czhfRHMlLxSZXA0qlMZRf8x2U3luBke51A5mY7/XhZbu2Jpe9ZWNNo2MZPnG/QKwSKemZDExBQ=="/>
         </item>
     </channel>
 </rss>
