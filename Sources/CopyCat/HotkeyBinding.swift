@@ -1,3 +1,4 @@
+import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
 
@@ -11,13 +12,36 @@ private let modifierMask: UInt64 =
     CGEventFlags.maskControl.rawValue |
     CGEventFlags.maskShift.rawValue
 
-struct HotkeyBinding: Equatable, Sendable {
+struct HotkeyBinding: Equatable, Hashable, Sendable {
     var keyCode: Int
     var modifiers: UInt64
 
     init(keyCode: Int, modifiers: UInt64) {
         self.keyCode = keyCode
         self.modifiers = modifiers & modifierMask
+    }
+
+    /// Rebuilds a binding from Carbon's modifier encoding. Inverse of
+    /// `carbonModifiers`.
+    init(keyCode: Int, carbonModifiers: UInt32) {
+        var flags: UInt64 = 0
+        if carbonModifiers & UInt32(cmdKey)     != 0 { flags |= CGEventFlags.maskCommand.rawValue }
+        if carbonModifiers & UInt32(optionKey)  != 0 { flags |= CGEventFlags.maskAlternate.rawValue }
+        if carbonModifiers & UInt32(controlKey) != 0 { flags |= CGEventFlags.maskControl.rawValue }
+        if carbonModifiers & UInt32(shiftKey)   != 0 { flags |= CGEventFlags.maskShift.rawValue }
+        self.init(keyCode: keyCode, modifiers: flags)
+    }
+
+    /// This chord in the encoding `RegisterEventHotKey` expects. Carbon's
+    /// modifier bits and CGEventFlags share no values, so the two are never
+    /// interchangeable even though both describe the same four modifiers.
+    var carbonModifiers: UInt32 {
+        var carbon: UInt32 = 0
+        if modifiers & CGEventFlags.maskCommand.rawValue   != 0 { carbon |= UInt32(cmdKey) }
+        if modifiers & CGEventFlags.maskAlternate.rawValue != 0 { carbon |= UInt32(optionKey) }
+        if modifiers & CGEventFlags.maskControl.rawValue   != 0 { carbon |= UInt32(controlKey) }
+        if modifiers & CGEventFlags.maskShift.rawValue     != 0 { carbon |= UInt32(shiftKey) }
+        return carbon
     }
 
     // Virtual keycode 9 = "v" on the US layout — keycodes are positional,
@@ -28,11 +52,6 @@ struct HotkeyBinding: Equatable, Sendable {
         keyCode: 9,
         modifiers: CGEventFlags.maskCommand.rawValue
     )
-
-    func matches(keyCode: Int64, flags: CGEventFlags) -> Bool {
-        guard Int(keyCode) == self.keyCode else { return false }
-        return matchesModifiers(flags)
-    }
 
     /// Modifier-only match, for callers that already know the key (the IOHID
     /// sensor reports V by HID usage, not by CGEvent keycode).
@@ -53,7 +72,7 @@ struct HotkeyBinding: Equatable, Sendable {
 }
 
 // Fixed set of broadcast chords. ⌘V coincides with local paste — broadcast
-// already wins precedence in PasteHandler, so picking ⌘V means broadcast
+// wins that collision in HotkeyPlan, so picking ⌘V means broadcast
 // effectively replaces local while broadcast is enabled.
 enum BroadcastHotkey: String, CaseIterable, Codable, Identifiable, Sendable {
     case cmdV

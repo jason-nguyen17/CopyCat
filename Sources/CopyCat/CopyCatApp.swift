@@ -47,7 +47,7 @@ private enum MenuBarIconFactory {
     }()
 
     // Same paw with an exclamation badge in the corner: the persistent,
-    // glanceable "paste is broken" signal while Secure Input blocks the tap.
+    // glanceable "paste is broken" signal while Secure Input is active.
     static let blocked: NSImage = {
         let base = normal
         let size = base.size == .zero ? NSSize(width: 18, height: 18) : base.size
@@ -78,6 +78,15 @@ private struct MenuBarLabel: View {
     var body: some View {
         Image(nsImage: status.secureInputAlerting ? MenuBarIconFactory.blocked : MenuBarIconFactory.normal)
             .accessibilityLabel(status.secureInputAlerting ? "CopyCat — paste blocked" : "CopyCat")
+    }
+}
+
+// The Accessibility grant gates every paste, so two menu surfaces offer it:
+// the header when it's missing, and Options as a standing escape hatch.
+private enum PrivacySettings {
+    static func openAccessibility() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
+        NSWorkspace.shared.open(url)
     }
 }
 
@@ -114,9 +123,7 @@ private struct CopyCatMenu: View {
             }
             Divider()
             Button("Open Accessibility settings") {
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-                    NSWorkspace.shared.open(url)
-                }
+                PrivacySettings.openAccessibility()
             }
             // The paste-attempt sensor (toast at the exact moment ⌘V is
             // pressed while blocked) needs Input Monitoring; hide the item
@@ -215,13 +222,20 @@ private struct StatusHeader: View {
     @ObservedObject private var status = StatusModel.shared
 
     var body: some View {
-        let tapText = status.tapEnabled ? "Tap on" : "Tap off"
-
-        Text("\(status.appName) — \(tapText)")
+        Text("\(status.appName) — \(status.hotkey.menuLabel)")
             .font(.headline)
 
-        // Secure Input silently blocks the tap for the whole session, so a
-        // green "Tap on" alone would be misleading — call out the culprit.
+        // Without Accessibility no chord is armed at all, so the header is the
+        // only place the user learns why ⌘V behaves normally again.
+        if status.hotkey == .needsAccessibility {
+            Button("Open Accessibility settings") {
+                PrivacySettings.openAccessibility()
+            }
+        }
+
+        // Secure Input silently stops hot keys from firing for the whole
+        // session, so a green "Hotkey on" alone would be misleading — call out
+        // the culprit.
         // Alert-worthy blocks get the orange treatment plus a one-click fix;
         // benign holds (focused password prompt) get a quiet gray note.
         if let secureInput = status.secureInput {
@@ -366,8 +380,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pasteHandler = PasteHandler()
         pasteHandler?.start()
 
-        SecureInputWatcher.shared.tapEnabledProvider = { [weak self] in
-            self?.pasteHandler?.isTapEnabled ?? false
+        SecureInputWatcher.shared.hotkeyStatusProvider = { [weak self] in
+            self?.pasteHandler?.hotkeyStatus ?? .off
         }
         SecureInputWatcher.shared.start()
     }

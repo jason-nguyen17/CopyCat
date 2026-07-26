@@ -8,7 +8,11 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    # Pinned rather than macos-latest: each runner image carries exactly one
+    # Xcode major, and the package needs Swift 6.2 for isolated deinit. On
+    # macos-15 (Xcode 16) the manifest doesn't even parse.
+    runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: swift build
+      - run: swift test

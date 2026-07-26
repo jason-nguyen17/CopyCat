@@ -2,7 +2,7 @@
 
 **CLI-only** — no Xcode. All builds use `swift build` via SPM. Use `just` as the task runner.
 
-- macOS 14.0+, Swift 6.0+
+- macOS 14.0+, Swift 6.2+ (hot key teardown uses `isolated deinit`, non-experimental only from 6.2)
 
 ```bash
 just dev          # Kill, build, sign, install to /Applications/CopyCat Dev.app, launch

@@ -3,24 +3,24 @@ import CoreGraphics
 
 // Owns Secure Input detection and every user-facing surface for it: menu
 // model, menu-bar icon badge, HUD toast, and notification banner. PasteHandler
-// keeps only tap health — it can't own alerting because a blocked tap receives
-// nothing, so it can't even see the state change promptly.
+// keeps only hot key health — it can't own alerting because a blocked hot key
+// never fires, so it can't even see the state change promptly.
 //
 // Detection is layered:
 //  - a 2s poll (1s while blocked, to announce recovery fast),
 //  - probes at the moments a block is born or becomes relevant: screen
 //    unlock (the stuck-loginwindow bug appears exactly there), wake,
 //    screensaver stop, and app activation,
-//  - optionally the IOHID paste-attempt sensor while blocked (the event tap
-//    is blind then, but IOHID still sees ⌘V), so the toast can fire at the
+//  - optionally the IOHID paste-attempt sensor while blocked (hot keys don't
+//    fire then, but IOHID still sees ⌘V), so the toast can fire at the
 //    exact moment the user tries to paste.
 @MainActor
 final class SecureInputWatcher {
     static let shared = SecureInputWatcher()
 
     /// Lets one poll publish both halves of the menu header; the watcher has
-    /// no other reason to know about the tap.
-    var tapEnabledProvider: (@MainActor () -> Bool)?
+    /// no other reason to know about the hot keys.
+    var hotkeyStatusProvider: (@MainActor () -> HotkeyStatus)?
 
     private var pollTimer: Timer?
     private var pollingWhileBlocked = false
@@ -43,9 +43,6 @@ final class SecureInputWatcher {
     private var displayedKey: String?
 
     private var sensor: PasteAttemptSensor?
-    private var lastDegradedPasteAt: TimeInterval = 0
-    /// Physical double-taps aside, one ⌘V should produce one typed path.
-    private static let degradedPasteCooldown: TimeInterval = 1
 
     private static let idleInterval: TimeInterval = 2
     private static let blockedInterval: TimeInterval = 1
@@ -227,10 +224,10 @@ final class SecureInputWatcher {
     }
 
     private func publishModel(_ presentation: SecureInputPresentation?) {
-        let tapEnabled = tapEnabledProvider?()
+        let hotkeyStatus = hotkeyStatusProvider?()
         let alerting = policy.isAlerting
         let model = StatusModel.shared
-        if let tapEnabled, model.tapEnabled != tapEnabled { model.tapEnabled = tapEnabled }
+        if let hotkeyStatus, model.hotkey != hotkeyStatus { model.hotkey = hotkeyStatus }
         if model.secureInput != presentation { model.secureInput = presentation }
         if model.secureInputAlerting != alerting { model.secureInputAlerting = alerting }
     }
@@ -281,9 +278,10 @@ final class SecureInputWatcher {
         guard pasteboard.hasImageType else { return }
 
         if degradedPasteAllowed(presentation: presentation, flags: flags, pasteboard: pasteboard) {
-            let now = Date().timeIntervalSinceReferenceDate
-            guard now - lastDegradedPasteAt > Self.degradedPasteCooldown else { return }
-            lastDegradedPasteAt = now
+            // Shared with the hot key path: if a registered chord does still
+            // fire under Secure Input, one keystroke reaches both paths and
+            // would otherwise type the path twice.
+            guard PasteCooldown.shared.claim(.localPaste) else { return }
             Log.secure.info("degraded paste: \(HotkeyBinding.localPaste.displayString) seen via HID while blocked — typing image path despite Secure Input (experimental)")
             SecureInputHUD.shared.showDegradedAttempt(presentation)
             DispatchQueue.global(qos: .userInitiated).async {
