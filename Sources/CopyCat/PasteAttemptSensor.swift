@@ -1,10 +1,10 @@
 import AppKit
 import IOKit.hid
 
-// Detects ⌘V while Secure Input is blocking the event tap. Secure Input hides
-// keyboard events from CGEventTaps but not from IOHID device monitoring, so
-// this is the only way to know the user just tried to paste while blocked —
-// the tap literally never sees the keystroke. Listen-only (no seize): the
+// Detects ⌘V while Secure Input is blocking CopyCat. Secure Input hides
+// keyboard events from event taps and hot key dispatch, but not from IOHID
+// device monitoring, so this is the only way to know the user just tried to
+// paste while blocked. Listen-only (no seize): the
 // original event still reaches the frontmost app untouched. Non-chord keys
 // are discarded in the callback; nothing is stored or logged.
 //

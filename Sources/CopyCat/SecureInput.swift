@@ -4,11 +4,11 @@ import Foundation
 import IOKit
 
 // macOS Secure Input (EnableSecureEventInput) is session-wide, not per-app:
-// while any one process holds it, the kernel stops delivering key events to
-// *every* CGEventTap, regardless of which app is frontmost. At the tap this is
-// indistinguishable from "enabled but dead" — same symptom, opposite cause.
-// A tap reinstall cannot bypass Secure Input, so the watchdog must detect it
-// explicitly instead of churning the tap.
+// while any one process holds it, the kernel routes key events straight to the
+// secure field, so event taps see nothing and registered hot keys never fire —
+// regardless of which app is frontmost. From the receiving side that is
+// indistinguishable from the user simply not pressing the chord, so the state
+// has to be detected explicitly rather than inferred from silence.
 enum SecureInput {
     /// Who holds the lock, and whether that process still exists.
     struct Owner: Equatable, Sendable {
@@ -74,7 +74,7 @@ enum SecureInput {
         var buffer = [CChar](repeating: 0, count: 128)
         let length = proc_name(pid, &buffer, UInt32(buffer.count))
         guard length > 0 else { return nil }
-        return String(cString: buffer)
+        return String(decoding: buffer.prefix(Int(length)).map(UInt8.init(bitPattern:)), as: UTF8.self)
     }
 
     /// PID recorded as the Secure Input owner, or nil when the key is absent.

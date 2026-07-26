@@ -1,268 +1,314 @@
 import AppKit
 import CoreGraphics
 
-// All mutation happens on the main thread (eventtap callback + watchdog
-// timer fire there). We mark Sendable for the [weak self] capture in
-// the watchdog closure; concurrent access isn't actually possible.
-final class PasteHandler: @unchecked Sendable {
-    private var tap: CFMachPort?
-    private var runloopSource: CFRunLoopSource?
-    private var watchdog: Timer?
-    private var lastEventTime: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
-    private var starvedRebuilds = 0
+// Registers CopyCat's chords with the system instead of tapping the keystroke
+// stream, and arms them only in the narrow window where CopyCat would actually
+// act: a target terminal frontmost, an image on the clipboard, Accessibility
+// granted.
+//
+// The arming is not an optimization, it's the whole design. A Carbon hot key is
+// all-or-nothing — once registered the OS matches and swallows the chord before
+// any app sees it, with no way to decline and let the keystroke through — and
+// the chord in question is plain ⌘V. Holding it unconditionally would break
+// paste in every app on the system. Registering only across the window where
+// the keystroke was ours anyway reproduces the old conditional behavior.
+//
+// The gate inputs are all observable outside the keystroke path (workspace
+// activation notifications, pasteboard change count, TCC trust), so nothing
+// here sits between the user and their input. A handler that hangs can only
+// delay CopyCat's own paste.
+//
+// The gate is sampled up to one poll interval before the keystroke lands, so
+// it can be stale by the time a chord fires. That case is not a no-op: the
+// keystroke is already gone, and `passThrough` has to hand it back.
+
+/// The system inputs the arming decision reads. Injectable so the gate — the
+/// rule standing between "⌘V works everywhere" and "⌘V is dead system-wide" —
+/// can be exercised without a frontmost app, a real clipboard, a granted
+/// Accessibility permission, or posting events at the live session.
+@MainActor
+struct HotkeyEnvironment {
+    var frontmostBundleID: @MainActor () -> String?
+    var clipboardHasImage: @MainActor () -> Bool
+    var clipboardChangeCount: @MainActor () -> Int
+    var accessibilityTrusted: @MainActor () -> Bool
+    var postChord: @MainActor (HotkeyBinding) -> Void
+    /// Shared with the Secure Input sensor in production, per-instance in
+    /// tests: a process-global wall-clock window would make anything that
+    /// reaches the paste itself depend on how fast the suite runs.
+    var pasteCooldown: PasteCooldown
+    var performPaste: @MainActor (HotkeyAction) -> Void
+
+    static let system = HotkeyEnvironment(
+        frontmostBundleID: { NSWorkspace.shared.frontmostApplication?.bundleIdentifier },
+        clipboardHasImage: { NSPasteboard.general.hasImageType },
+        clipboardChangeCount: { NSPasteboard.general.changeCount },
+        accessibilityTrusted: { AXIsProcessTrusted() },
+        postChord: { Typer.postChord($0) },
+        pasteCooldown: .shared,
+        performPaste: { action in
+            // The clipboard is re-read on the worker, which bails cleanly if
+            // the image vanished; keeping the read off the hot key handler
+            // keeps it short.
+            switch action {
+            case .localPaste:
+                DispatchQueue.global(qos: .userInitiated).async {
+                    ImagePaste.handleLocal()
+                }
+            case .broadcast:
+                DispatchQueue.global(qos: .userInitiated).async {
+                    Broadcast.handle()
+                }
+            }
+        })
+}
+
+@MainActor
+final class PasteHandler {
+    private let hotkeys: HotkeyManager
+    private let environment: HotkeyEnvironment
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var defaultsObservers: [NSObjectProtocol] = []
+    private var clipboardPoll: Timer?
+    private var lastClipboardChangeCount = 0
+
+    // The pasteboard posts no change notification, so this poll bounds how
+    // stale the arming decision can be — "screenshot, then immediately ⌘V"
+    // has to land. A tick costs one integer read unless the clipboard moved,
+    // and the timer only runs while a target app is frontmost.
+    private static let clipboardPollInterval: TimeInterval = 0.25
+
+    init(hotkeys: HotkeyManager = HotkeyManager(), environment: HotkeyEnvironment = .system) {
+        self.hotkeys = hotkeys
+        self.environment = environment
+    }
+
+    isolated deinit {
+        // The run loop retains the poll timer, so without this it keeps ticking
+        // against a dead weak self for the life of the process.
+        removeObservers()
+        setClipboardPolling(false)
+    }
 
     func start() {
-        installTap()
-        startWatchdog()
-
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            Log.tap.info("wake detected — reinstalling tap")
-            self?.teardownTap()
-            self?.installTap()
+        hotkeys.onFire = { [weak self] action in
+            self?.fire(action)
         }
+        promptForAccessibilityIfNeeded()
+        installObservers()
+        reconcile(reason: "startup")
     }
 
     func stop() {
-        NSWorkspace.shared.notificationCenter.removeObserver(self)
-        watchdog?.invalidate()
-        watchdog = nil
-        teardownTap()
+        removeObservers()
+        setClipboardPolling(false)
+        hotkeys.onFire = nil
+        hotkeys.invalidate()
     }
 
-    // Public probe so the menu bar status header can reflect tap state.
-    var isTapEnabled: Bool {
-        guard let tap else { return false }
-        return CGEvent.tapIsEnabled(tap: tap)
-    }
-
-    // Push tap state into the observable menu model. The menu can't read it
-    // live (the read isn't observable, so SwiftUI froze it at launch — the old
-    // "Tap off" bug), so we publish on every state change and once per
-    // watchdog tick; SecureInputWatcher also refreshes it on its own poll.
-    // Callers are always on the main thread (start / wake observer /
-    // main-runloop timer), so assumeIsolated is safe and avoids an async hop.
-    // Secure Input state is owned end-to-end by SecureInputWatcher.
-    private func publishStatus() {
-        let enabled = isTapEnabled
-        MainActor.assumeIsolated {
-            let model = StatusModel.shared
-            if model.tapEnabled != enabled { model.tapEnabled = enabled }
+    /// What the menu header should say about interception. Not "armed right
+    /// now", which flips with every app switch and would read as breakage.
+    /// Every not-working answer names its own cause: the alternative is one
+    /// "off" that could mean a toggle, a missing grant, or a chord another app
+    /// permanently owns, none of which are fixed the same way.
+    var hotkeyStatus: HotkeyStatus {
+        guard Settings.enableLocalPaste || Settings.enableBroadcast else { return .off }
+        guard environment.accessibilityTrusted() else { return .needsAccessibility }
+        if let failure = hotkeys.lastFailure {
+            return .unavailable(chord: failure.binding.displayString)
         }
+        return .on
     }
 
-    private func teardownTap() {
-        if let tap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-            if let src = runloopSource {
-                CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes)
+    // MARK: - Arming
+
+    private func installObservers() {
+        let wnc = NSWorkspace.shared.notificationCenter
+        func workspace(_ name: Notification.Name, _ reason: String) {
+            let token = wnc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.reconcile(reason: reason)
+                }
             }
-            CFMachPortInvalidate(tap)
+            workspaceObservers.append(token)
         }
-        tap = nil
-        runloopSource = nil
+
+        workspace(NSWorkspace.didActivateApplicationNotification, "app activated")
+        // Lock and sleep post no activation notification, so a chord armed in a
+        // terminal is still held when the machine comes back — possibly with a
+        // different app frontmost and a different clipboard. Re-derive it from
+        // what is true now.
+        workspace(NSWorkspace.didWakeNotification, "wake")
+        workspace(NSWorkspace.screensDidWakeNotification, "screens woke")
+
+        // Every user-facing toggle lands in UserDefaults, so one observer covers
+        // enabling/disabling a chord, changing the broadcast chord, and editing
+        // the target app list.
+        let defaults = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.reconcile(reason: "settings changed")
+            }
+        }
+        defaultsObservers.append(defaults)
+    }
+
+    private func removeObservers() {
+        workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+        workspaceObservers = []
+        defaultsObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        defaultsObservers = []
+    }
+
+    func reconcile(reason: String) {
+        let frontmost = environment.frontmostBundleID()
+        let targets = Settings.targetBundleIDs
+        let targetFrontmost = frontmost.map(targets.contains) ?? false
+
+        setClipboardPolling(targetFrontmost)
+        lastClipboardChangeCount = environment.clipboardChangeCount()
+
+        // Only ask the pasteboard when the answer could change the plan; this
+        // runs on every app switch and every clipboard change.
+        let clipboardHasImage = targetFrontmost && environment.clipboardHasImage()
+
+        // Re-read on every reconcile rather than caching from startup: the
+        // grant can land while CopyCat is running, and this is what makes it
+        // take effect without a restart.
+        let accessibilityTrusted = environment.accessibilityTrusted()
+
+        hotkeys.apply(
+            HotkeyPlan.desired(
+                frontmostBundleID: frontmost,
+                targetBundleIDs: targets,
+                clipboardHasImage: clipboardHasImage,
+                accessibilityTrusted: accessibilityTrusted,
+                localPasteEnabled: Settings.enableLocalPaste,
+                broadcastEnabled: Settings.enableBroadcast,
+                broadcastBinding: Settings.broadcastHotkey.binding),
+            reason: reason)
+
         publishStatus()
     }
 
-    private func installTap() {
-        // Publish on every exit path so a failed install (no Accessibility,
-        // nil tap) shows "Tap off" rather than a stale value.
-        defer { publishStatus() }
-        guard ensureAccessibility(prompt: true) else {
-            Log.tap.error("Accessibility not granted — tap NOT installed. Grant in System Settings → Privacy & Security → Accessibility, then relaunch.")
+    var isPollingClipboard: Bool { clipboardPoll != nil }
+
+    private func setClipboardPolling(_ enabled: Bool) {
+        guard enabled != (clipboardPoll != nil) else { return }
+        guard enabled else {
+            clipboardPoll?.invalidate()
+            clipboardPoll = nil
             return
         }
-
-        // Subscribe to keyDown plus the two "OS killed your tap" events so we
-        // can re-enable inline without losing keystrokes.
-        let mask: CGEventMask =
-            (1 << CGEventType.keyDown.rawValue) |
-            (1 << CGEventType.tapDisabledByTimeout.rawValue) |
-            (1 << CGEventType.tapDisabledByUserInput.rawValue)
-
-        let userInfo = Unmanaged.passUnretained(self).toOpaque()
-
-        let tap = CGEvent.tapCreate(
-            tap: .cghidEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: mask,
-            callback: { _, type, event, refcon in
-                guard let refcon else { return Unmanaged.passUnretained(event) }
-                let handler = Unmanaged<PasteHandler>.fromOpaque(refcon).takeUnretainedValue()
-                return handler.handle(type: type, event: event)
-            },
-            userInfo: userInfo
-        )
-
-        guard let tap else {
-            Log.tap.error("CGEvent.tapCreate returned nil — Accessibility may have been revoked")
-            return
-        }
-
-        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
-
-        self.tap = tap
-        self.runloopSource = src
-        Log.tap.info("installed (enabled=\(CGEvent.tapIsEnabled(tap: tap)))")
-    }
-
-    private func frontmostBundleID() -> String? {
-        NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-    }
-
-    private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        lastEventTime = CFAbsoluteTimeGetCurrent()
-
-        // OS killed the tap — re-enable in place. The event itself is
-        // synthetic and gets discarded.
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            let reason = type == .tapDisabledByTimeout ? "timeout" : "userInput"
-            Log.tap.info("OS disabled tap (\(reason)) — re-enabling")
-            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
-            return nil
-        }
-
-        guard type == .keyDown else {
-            return Unmanaged.passUnretained(event)
-        }
-
-        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        let flags = event.flags
-
-        let isLocal     = Settings.enableLocalPaste && HotkeyBinding.localPaste.matches(keyCode: keyCode, flags: flags)
-        let isBroadcast = Settings.enableBroadcast && Settings.broadcastHotkey.binding.matches(keyCode: keyCode, flags: flags)
-
-        guard isLocal || isBroadcast else {
-            return Unmanaged.passUnretained(event)
-        }
-
-        // Broadcast wins ties: if both bindings collide, the more-specific
-        // (more-modifiers) chord is the broadcast one in the default config.
-        let category = isBroadcast ? Log.cmdOptV : Log.cmdV
-
-        let frontmost = frontmostBundleID()
-        guard let frontmost, Settings.targetBundleIDs.contains(frontmost) else {
-            category.info("bail — frontmost is \(frontmost ?? "nil")")
-            return Unmanaged.passUnretained(event)
-        }
-
-        // Quick clipboard probe: just check declared types, don't read the
-        // image. The full read happens off-thread so this callback returns
-        // in <5ms even on a giant Retina capture.
-        guard NSPasteboard.general.hasImageType else {
-            category.info("bail — clipboard has no image")
-            return Unmanaged.passUnretained(event)
-        }
-
-        if isBroadcast {
-            DispatchQueue.global(qos: .userInitiated).async {
-                Broadcast.handle()
-            }
-        } else {
-            DispatchQueue.global(qos: .userInitiated).async {
-                ImagePaste.handleLocal()
+        clipboardPoll = Timer.scheduledTimer(
+            withTimeInterval: Self.clipboardPollInterval, repeats: true
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.pollClipboard()
             }
         }
-        return nil
     }
 
-    private func startWatchdog() {
-        watchdog = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.checkAndRevive()
-        }
+    private func pollClipboard() {
+        let count = environment.clipboardChangeCount()
+        guard count != lastClipboardChangeCount else { return }
+        reconcile(reason: "clipboard changed")
     }
 
-    // How long the tap must be silent before we look for blocked delivery paths.
-    // Silence is NOT proof of a dead tap — it's identical to the user simply not
-    // typing — so it only gates checks that have an independent signal. Secure
-    // Input is detected directly, and real tap death must surface via tapIsEnabled,
-    // the OS tapDisabled events, or the starved-queue check below.
-    private static let staleTapInterval: CFTimeInterval = 90
-
-    // WindowServer-reported queue latency above which an "enabled" tap is
-    // treated as dead. Healthy FILTER taps report µs–ms; WindowServer's own
-    // per-event tap timeout is single-digit seconds, so anything past 5s means
-    // events are rotting in the queue, not being processed slowly.
-    private static let starvedTapLatencyUs: Float = 5_000_000
-
-    // How WindowServer sees our tap. A starved tap — mach port still registered
-    // but its events no longer being serviced — keeps reporting enabled=true,
-    // so tapIsEnabled can't detect it. The queue latency WindowServer tracks
-    // per tap can: it grows in lockstep with wall clock while an event sits
-    // undelivered.
-    private func reportedTapLatencyUs() -> Float? {
-        var count: UInt32 = 0
-        guard CGGetEventTapList(0, nil, &count) == .success, count > 0 else { return nil }
-        var taps = [CGEventTapInformation](repeating: CGEventTapInformation(), count: Int(count))
-        guard CGGetEventTapList(count, &taps, &count) == .success else { return nil }
-        let pid = getpid()
-        return taps.prefix(Int(count))
-            .filter { $0.tappingProcess == pid }
-            .map(\.avgUsecLatency)
-            .max()
+    // Push readiness into the observable menu model. The menu can't read it
+    // live (the read isn't observable, so SwiftUI froze it at launch — the old
+    // permanently-wrong header bug), so publish on every state change;
+    // SecureInputWatcher also refreshes it on its own poll. Secure Input state
+    // is owned end-to-end by SecureInputWatcher.
+    private func publishStatus() {
+        let status = hotkeyStatus
+        let model = StatusModel.shared
+        if model.hotkey != status { model.hotkey = status }
     }
 
-    private func checkAndRevive() {
-        // Refresh the menu model once per tick regardless of which branch we
-        // take — this is what keeps Secure Input status current in the menu.
-        defer { publishStatus() }
-        guard let tap else {
-            Log.watchdog.info("tap is nil; reinstalling")
-            installTap()
-            return
-        }
-        let enabled = CGEvent.tapIsEnabled(tap: tap)
-        let silent = CFAbsoluteTimeGetCurrent() - lastEventTime
+    // MARK: - Dispatch
 
-        // Starved tap: enabled by every local measure, but WindowServer shows
-        // events queued and unserviced. Re-enabling is a no-op for this state;
-        // only a full rebuild recovers. Gate on silence too so one slow event
-        // around a sleep/wake transition doesn't churn a healthy tap. Repeated
-        // rebuilds point to an upstream event-delivery/session problem; the count
-        // in the log line is the diagnostic signal.
-        if enabled && silent > Self.staleTapInterval,
-           let latencyUs = reportedTapLatencyUs(), latencyUs > Self.starvedTapLatencyUs {
-            starvedRebuilds += 1
-            Log.watchdog.error("tap starved — enabled but WindowServer queue latency \(Int(latencyUs / 1_000_000))s; rebuilding (rebuild #\(starvedRebuilds) since last healthy tick)")
-            teardownTap()
-            installTap()
+    func fire(_ action: HotkeyAction) {
+        let category = action == .broadcast ? Log.cmdOptV : Log.cmdV
+
+        // Both gate inputs are re-read rather than trusted from arming time:
+        // an activation notification or a clipboard change can land after a
+        // keystroke the user already pressed, and typing a file path into the
+        // wrong app is worse than not pasting.
+        let outcome = HotkeyFire.outcome(
+            frontmostBundleID: environment.frontmostBundleID(),
+            targetBundleIDs: Settings.targetBundleIDs,
+            clipboardHasImage: environment.clipboardHasImage())
+
+        if case .passThrough(let reason) = outcome {
+            passThrough(action, reason: reason, category: category)
             return
         }
 
-        // Long silence with the tap still "enabled" has one confirmed cause:
-        // Secure Input swallowing key events. A reinstall can't defeat Secure
-        // Input, and rebuilding on silence just churned a healthy, merely-idle
-        // tap every 30s — so skip the rebuild path entirely. Alerting the user
-        // is SecureInputWatcher's job; this branch only protects the tap.
-        if enabled && silent > Self.staleTapInterval, case .blocked(let owner) = SecureInput.status() {
-            Log.watchdog.info("tap silent \(Int(silent))s with Secure Input active (\(owner?.description ?? "unknown source")) — not rebuilding")
+        guard environment.pasteCooldown.claim(action) else {
+            category.info("ignored — this chord already pasted moments ago, so this is one keystroke arriving twice")
             return
         }
 
-        if enabled {
-            starvedRebuilds = 0
-            Log.watchdog.info("tap.enabled=true")
-            return
-        }
-        Log.watchdog.info("tap.enabled=false; re-enabling")
-        CGEvent.tapEnable(tap: tap, enable: true)
-        if !CGEvent.tapIsEnabled(tap: tap) {
-            Log.watchdog.error("re-enable did not stick; full reinstall")
-            teardownTap()
-            installTap()
-        }
+        environment.performPaste(action)
     }
 
-    private func ensureAccessibility(prompt: Bool) -> Bool {
+    /// Hands back a keystroke CopyCat swallowed but won't act on. Without this
+    /// the user's ⌘V is destroyed: the OS consumed it on our behalf and the
+    /// focused app never saw it.
+    private func passThrough(_ action: HotkeyAction, reason: HotkeyBailReason, category: AppLogger) {
+        let binding = hotkeys.activeBindings[action]
+
+        // Release before posting, always. The synthetic event carries the same
+        // modifiers the hot key matches on, so posting it while the chord is
+        // still claimed feeds it straight back into this handler — this
+        // ordering is the entire loop guard.
+        let released = binding != nil
+            && hotkeys.release(action, reason: "passthrough (\(reason.rawValue))")
+
+        // The gate that just failed is shared by every chord, not only the one
+        // that fired. A sibling left armed goes on swallowing keystrokes for a
+        // window that has already closed, so drop them in the same pass rather
+        // than waiting for the next reconcile — including when the fired chord
+        // itself turned out not to be held.
+        for sibling in hotkeys.activeBindings.keys where sibling != action {
+            guard let siblingBinding = hotkeys.activeBindings[sibling] else { continue }
+            if hotkeys.release(sibling, reason: "passthrough sibling (\(reason.rawValue))") {
+                category.info("also released \(siblingBinding.displayString) — the gate is closed for every chord")
+            } else {
+                category.error("could not release \(siblingBinding.displayString) on passthrough — it stays claimed")
+            }
+        }
+
+        guard let binding else {
+            category.info("bail (\(reason.rawValue)) — no chord held for this action, nothing to hand back")
+            return
+        }
+
+        guard released, hotkeys.activeBindings[action] == nil else {
+            category.error("passthrough aborted — \(binding.displayString) is still registered; posting it would re-enter this handler")
+            return
+        }
+
+        category.info("bail (\(reason.rawValue)) — released \(binding.displayString) and handed the keystroke back")
+        environment.postChord(binding)
+        // Re-arming is left to the normal reconcile path. The gate just failed,
+        // so it stays down until the conditions actually return.
+    }
+
+    // The hot key itself needs no TCC grant, but the paste does: typing the
+    // file path posts synthetic key events, which the OS silently drops for an
+    // untrusted process. Prompting at startup turns that into a permission
+    // dialog rather than a menu that says "needs Accessibility" with no
+    // explanation of when it was asked for.
+    private func promptForAccessibilityIfNeeded() {
         // Hardcoded value of kAXTrustedCheckOptionPrompt — referencing the
         // global var trips Swift 6 strict concurrency (it's non-Sendable).
         let key = "AXTrustedCheckOptionPrompt" as CFString
-        let opts = [key: prompt] as CFDictionary
-        return AXIsProcessTrustedWithOptions(opts)
+        let opts = [key: true] as CFDictionary
+        guard !AXIsProcessTrustedWithOptions(opts) else { return }
+        Log.hotkey.error("Accessibility not granted — chords stay unregistered until it is. Grant in System Settings → Privacy & Security → Accessibility.")
     }
 }
 
@@ -310,5 +356,25 @@ enum Typer {
             up?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &unit)
             up?.post(tap: .cghidEventTap)
         }
+    }
+
+    /// Re-posts a chord CopyCat swallowed and decided not to act on, so the
+    /// focused app receives the keystroke the user actually pressed.
+    ///
+    /// Unlike `type`, this deliberately carries modifier flags — it is the
+    /// chord — so it *will* match a live registration of the same chord. Only
+    /// call it once that registration is gone.
+    static func postChord(_ binding: HotkeyBinding) {
+        guard let source = CGEventSource(stateID: .hidSystemState) else { return }
+        let flags = CGEventFlags(rawValue: binding.modifiers)
+        let key = CGKeyCode(binding.keyCode)
+
+        let down = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true)
+        down?.flags = flags
+        down?.post(tap: .cghidEventTap)
+
+        let up = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
+        up?.flags = flags
+        up?.post(tap: .cghidEventTap)
     }
 }

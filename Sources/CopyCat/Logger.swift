@@ -81,10 +81,9 @@ enum LogSubsystem {
 
 enum Log {
     static let app      = AppLogger(category: "App")
-    static let tap      = AppLogger(category: "Tap")
+    static let hotkey   = AppLogger(category: "Hotkey")
     static let cmdV     = AppLogger(category: "Local")
     static let cmdOptV  = AppLogger(category: "Broadcast")
-    static let watchdog = AppLogger(category: "Watchdog")
     static let secure   = AppLogger(category: "SecureInput")
 }
 
