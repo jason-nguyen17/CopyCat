@@ -339,23 +339,35 @@ extension NSPasteboard {
 }
 
 enum Typer {
-    // Synthesize keystrokes via keyboardSetUnicodeString so we don't have to
-    // map characters to physical keycodes. The synthesized events have no
-    // modifier flags so they won't re-trigger our hotkey handler.
+    // Deliver the path in a few Unicode events. Sending a key pair per
+    // character can overwhelm terminal input editors; posting more than 20
+    // UTF-16 units in one event can truncate the text. A private source keeps
+    // the synthetic text independent of the physical ⌘ key being released.
     static func type(_ text: String) {
-        guard let source = CGEventSource(stateID: .hidSystemState) else { return }
-        for codeUnit in text.utf16 {
-            var unit = codeUnit
+        guard let source = CGEventSource(stateID: .privateState) else { return }
+        var chunk: [UniChar] = []
+
+        func postChunk() {
+            guard !chunk.isEmpty else { return }
             let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true)
             down?.flags = []
-            down?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &unit)
+            chunk.withUnsafeBufferPointer { buffer in
+                down?.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress)
+            }
             down?.post(tap: .cghidEventTap)
 
             let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
             up?.flags = []
-            up?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &unit)
             up?.post(tap: .cghidEventTap)
+            chunk.removeAll(keepingCapacity: true)
         }
+
+        for scalar in text.unicodeScalars {
+            let units = Array(String(scalar).utf16)
+            if chunk.count + units.count > 16 { postChunk() }
+            chunk.append(contentsOf: units)
+        }
+        postChunk()
     }
 
     /// Re-posts a chord CopyCat swallowed and decided not to act on, so the
