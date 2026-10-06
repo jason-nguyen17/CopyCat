@@ -101,6 +101,7 @@ private struct CopyCatMenu: View {
         Divider()
 
         Toggle("Local paste (\(HotkeyBinding.localPaste.displayString))", isOn: $store.enableLocalPaste)
+            .help("Controls local image paths only. SSH paste can still use ⌘V when enabled.")
         Toggle("SSH paste (\(store.broadcastHotkey.label))", isOn: $store.enableBroadcast)
 
         Divider()

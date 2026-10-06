@@ -91,6 +91,12 @@ private struct GeneralSettingsView: View {
                     }
                 }
                 .disabled(!store.enableBroadcast)
+
+                if !store.enableLocalPaste && store.enableBroadcast && store.broadcastHotkey == .cmdV {
+                    Text("SSH paste still uses ⌘V and types an image path. Choose another SSH hotkey to restore the terminal's normal ⌘V paste.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Cache") {

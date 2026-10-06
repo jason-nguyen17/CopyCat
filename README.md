@@ -80,6 +80,8 @@ Everything is configured in the CopyCat menu bar → **Settings…**:
 - **Apps** — bundle IDs of apps where paste is intercepted
 - **SSH hosts** — remote hosts; if Tailscale is installed, peers list with one-click add. Hosts are SSH'd as the current user (`ssh hostname`) — your `~/.ssh/config` and key auth apply.
 
+Local paste and SSH paste are independent. Turning off local paste does not disable SSH paste. If the SSH hotkey is ⌘V, CopyCat still types an image path when you press ⌘V in a configured terminal. Choose another SSH hotkey if you want ⌘V to use the terminal's normal paste behavior while SSH paste remains enabled.
+
 ## FAQ
 
 **Local paste types `/Users/you/.cache/copycat/…`, but SSH types `~/.cache/copycat/…`. Why the difference?**
